@@ -1,0 +1,8 @@
+build/
+*.xcodeproj/
+.DS_Store
+xcuserdata/
+*.xcworkspace/
+DerivedData/
+dist/
+Sources/Resources/Vigil.icns
