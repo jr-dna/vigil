@@ -72,7 +72,7 @@ clean:
 # "Disabling hardened runtime with ad-hoc codesigning".
 # ---------------------------------------------------------------------------
 
-SIGN_ID        := Developer ID Application: Jordan Alegant (FSY5635NFT)
+SIGN_ID        ?= Developer ID Application: Jordan Alegant (FSY5635NFT)
 NOTARY_PROFILE := vigil-notary
 DIST_DIR       := $(CURDIR)/dist
 RELEASE_APP    := $(BUILD_DIR)/Release/Vigil.app
