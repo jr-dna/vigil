@@ -30,26 +30,48 @@ enum Uninstaller {
         NSApp.activate(ignoringOtherApps: true)
         guard alert.runModal() == .alertFirstButtonReturn else { return }
 
-        if let bundleID = Bundle.main.bundleIdentifier {
-            // removePersistentDomain also clears cfprefsd's in-memory copy.
-            // Deleting the plist alone lets the settings come back.
-            UserDefaults.standard.removePersistentDomain(forName: bundleID)
-        }
-
         // If launch-at-login ever lands, unregister it here — before the
         // bundle moves — or the user is left with a login item pointing at
         // something in the Trash:
         //     try? SMAppService.mainApp.unregister()
 
+        // The bundle goes first, settings second. The other order wiped the
+        // settings and then quit even when the Trash step failed — leaving
+        // Vigil installed, unconfigured, and gone from the menu bar with no
+        // word as to why. Now a failure leaves everything as it was and says
+        // so.
+        //
         // Trashing a running app is safe: the process keeps its open file
         // handles, and macOS only reclaims the bundle once it exits.
         NSWorkspace.shared.recycle([bundleURL]) { _, error in
-            if let error {
-                NSLog("Vigil: couldn't move the bundle to the Trash: \(error.localizedDescription)")
-            }
-            DispatchQueue.main.async {
+            Task { @MainActor in
+                if let error {
+                    Uninstaller.reportFailure(error, bundleURL: bundleURL)
+                    return
+                }
+                if let bundleID = Bundle.main.bundleIdentifier {
+                    // removePersistentDomain also clears cfprefsd's in-memory
+                    // copy. Deleting the plist alone lets the settings come back.
+                    UserDefaults.standard.removePersistentDomain(forName: bundleID)
+                }
                 NSApp.terminate(nil)
             }
         }
+    }
+
+    private static func reportFailure(_ error: Error, bundleURL: URL) {
+        NSLog("Vigil: couldn't move the bundle to the Trash: \(error.localizedDescription)")
+
+        let failure = NSAlert()
+        failure.messageText = "Couldn't move Vigil to the Trash"
+        failure.informativeText = """
+        \(error.localizedDescription)
+
+        Nothing was removed, and your settings are untouched. You can drag Vigil \
+        to the Trash yourself from \(bundleURL.deletingLastPathComponent().path).
+        """
+        failure.alertStyle = .warning
+        NSApp.activate(ignoringOtherApps: true)
+        failure.runModal()
     }
 }

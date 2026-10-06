@@ -208,8 +208,8 @@ final class AssertionMonitor: ObservableObject {
     // MARK: Actions
 
     @discardableResult
-    func kill(_ record: AssertionRecord) -> ProcessTerminator.Outcome {
-        let outcome = ProcessTerminator.terminate(record)
+    func kill(_ record: AssertionRecord) async -> ProcessTerminator.Outcome {
+        let outcome = await ProcessTerminator.terminate(record)
         refresh()
         return outcome
     }
@@ -217,12 +217,29 @@ final class AssertionMonitor: ObservableObject {
     /// Kills every blocking assertion holder — everything the current user owns
     /// that is stopping the machine sleeping, including ones with a timeout.
     /// Never touches anything in the system bucket.
+    ///
+    /// Targets are the rows the user was looking at when they confirmed, not a
+    /// fresh read: Stop all should mean "the ones I saw". Each is re-verified
+    /// by the terminator before it's signalled, so anything that has exited
+    /// since is skipped rather than mistaken for its successor.
+    ///
+    /// The stops run concurrently, so the worst case is one grace period in
+    /// total rather than one per stubborn process.
     @discardableResult
-    func killAllBlocking() -> [ProcessTerminator.Outcome] {
+    func killAllBlocking() async -> [ProcessTerminator.Outcome] {
         // Deduplicate by PID: one process holding three assertions is one kill.
         var seen = Set<pid_t>()
         let targets = snapshot.blocking.filter { seen.insert($0.pid).inserted }
-        let outcomes = targets.map { ProcessTerminator.terminate($0) }
+
+        let outcomes = await withTaskGroup(of: ProcessTerminator.Outcome.self) { group in
+            for target in targets {
+                group.addTask { await ProcessTerminator.terminate(target) }
+            }
+            var collected: [ProcessTerminator.Outcome] = []
+            for await outcome in group { collected.append(outcome) }
+            return collected
+        }
+
         refresh()
         return outcomes
     }

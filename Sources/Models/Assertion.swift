@@ -28,7 +28,7 @@ enum AssertionKey {
 
 /// The assertion types power management reports. Raw values match the strings
 /// `pmset -g assertions` prints in its top block.
-enum AssertionKind: String {
+enum AssertionKind: String, Sendable {
     case preventUserIdleDisplaySleep = "PreventUserIdleDisplaySleep"
     case preventUserIdleSystemSleep  = "PreventUserIdleSystemSleep"
     case preventSystemSleep          = "PreventSystemSleep"
@@ -104,25 +104,25 @@ enum AssertionKind: String {
 /// *because* something else is holding the display awake, and `WindowServer`'s
 /// UserIsActive is the user typing. Neither is worth showing at the top level.
 ///
-/// The line is drawn on ownership, not on whether a timeout exists. A
-/// `caffeinate -d -t 600` is blocking sleep for the next ten minutes whether
-/// or not it will eventually clean up after itself — if you own it and it
-/// stops your Mac sleeping, you should be able to see it and stop it. The
-/// timeout shows up as a tag on the row instead.
+/// The line is drawn on whether you could stop it, not on whether a timeout
+/// exists. A `caffeinate -d -t 600` is blocking sleep for the next ten minutes
+/// whether or not it will eventually clean up after itself — if you own it and
+/// it stops your Mac sleeping, you should be able to see it and stop it. The
+/// remaining time shows up as a tag on the row instead.
 enum Classification {
-    /// Prevents sleep and belongs to the current user. Top level, with a
-    /// Stop button.
+    /// Prevents sleep and is stoppable: yours, and not part of macOS. Top
+    /// level, with a Stop button.
     case blocking
 
-    /// Owned by the OS, or doesn't prevent sleep at all. Collapsed by
-    /// default and never killable.
+    /// Part of macOS, owned by another user, or not preventing sleep at all.
+    /// Collapsed by default and never killable.
     case system
 }
 
 // MARK: - Record
 
 /// One assertion, joined to what is known about the process holding it.
-struct AssertionRecord: Identifiable {
+struct AssertionRecord: Identifiable, Sendable {
     let id: String
     let pid: pid_t
     let kind: AssertionKind
@@ -145,6 +145,20 @@ struct AssertionRecord: Identifiable {
         return Date().timeIntervalSince(createdAt)
     }
 
+    /// Time left before the assertion releases itself. `timeout` is the full
+    /// length it was created with, so showing that directly read "expires in
+    /// 10m" for all ten minutes.
+    var remaining: TimeInterval? {
+        guard hasTimeout else { return nil }
+        guard let duration else { return timeout }
+        return max(timeout - duration, 0)
+    }
+
+    var expiryLabel: String {
+        guard let remaining else { return "no timeout" }
+        return remaining < 1 ? "expiring" : "expires in \(remaining.durationLabel)"
+    }
+
     /// A process reparented to launchd has outlived whatever started it.
     ///
     /// Bundled applications are excluded: every app launched from the Dock or
@@ -164,8 +178,12 @@ struct AssertionRecord: Identifiable {
         return process.isSystemOwned
     }
 
+    /// Only something you can actually stop belongs at the top. Anything else
+    /// there would sit with a disabled Stop button and inflate the Stop all
+    /// count — another user's process under fast user switching was the case
+    /// that did it.
     var classification: Classification {
-        guard kind.preventsSleep, !isSystemOwned else { return .system }
+        guard kind.preventsSleep, let process, process.isKillable else { return .system }
         return .blocking
     }
 
@@ -223,13 +241,20 @@ struct AssertionRecord: Identifiable {
         self.process   = process
 
         // Prefer the assertion's own global ID so SwiftUI keeps row identity
-        // across refreshes. The fallback uses the assertion's position within
-        // its process rather than its contents: one process routinely holds
-        // several assertions of the same type created in the same instant
-        // (coreaudiod does it during playback), and a content-derived ID would
-        // collide — which makes ForEach silently drop the duplicates.
-        if let global = string(AssertionKey.globalID) {
-            self.id = global
+        // across refreshes — otherwise an expanded parent chain can jump to a
+        // different row when a process drops one of several assertions. The
+        // power manager stores it as a 64-bit number; earlier versions read it
+        // as a string, never found it, and always used the fallback.
+        //
+        // The fallback uses the assertion's position within its process rather
+        // than its contents: one process routinely holds several assertions of
+        // the same type created in the same instant (coreaudiod does it during
+        // playback), and a content-derived ID would collide — which makes
+        // ForEach silently drop the duplicates.
+        if let global = number(AssertionKey.globalID) {
+            self.id = "g\(global.uint64Value)"
+        } else if let global = string(AssertionKey.globalID) {
+            self.id = "g\(global)"
         } else {
             self.id = "\(pid)-\(index)-\(rawType)"
         }

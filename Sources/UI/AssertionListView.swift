@@ -9,6 +9,11 @@ struct AssertionListView: View {
     @State private var messageTask: Task<Void, Never>?
     @State private var confirmingKillAll = false
 
+    /// True while a Stop or Stop all is in flight. Stopping now suspends rather
+    /// than blocking, so the popover stays responsive — which means the buttons
+    /// have to be disabled explicitly, or a second click would race the first.
+    @State private var stopping = false
+
     private var snapshot: AssertionMonitor.Snapshot { monitor.snapshot }
 
     var body: some View {
@@ -22,7 +27,7 @@ struct AssertionListView: View {
                         quietState
                     } else {
                         ForEach(snapshot.blocking) { record in
-                            AssertionRow(record: record) { kill(record) }
+                            AssertionRow(record: record, stopping: stopping) { kill(record) }
                             Divider()
                         }
                     }
@@ -109,7 +114,14 @@ struct AssertionListView: View {
 
     private var killAllControl: some View {
         HStack {
-            if confirmingKillAll {
+            if stopping {
+                ProgressView()
+                    .controlSize(.small)
+                Text("Stopping…")
+                    .font(.system(size: 12))
+                    .foregroundStyle(.secondary)
+                Spacer()
+            } else if confirmingKillAll {
                 Text("Stop \(uniqueBlockingCount) process\(uniqueBlockingCount == 1 ? "" : "es")?")
                     .font(.system(size: 12))
                 Spacer()
@@ -181,6 +193,9 @@ struct AssertionListView: View {
 
     private var settingsMenu: some View {
         Menu {
+            Text(versionLabel)
+            Divider()
+
             Picker("Check for changes", selection: $monitor.refreshInterval) {
                 ForEach(RefreshInterval.allCases) { interval in
                     Text(interval.label).tag(interval)
@@ -200,6 +215,12 @@ struct AssertionListView: View {
         .menuIndicator(.hidden)
         .fixedSize()
         .help("How often Vigil checks for changes")
+    }
+
+    /// So "which version am I running?" doesn't need a terminal.
+    private var versionLabel: String {
+        let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "unknown"
+        return "Vigil \(version)"
     }
 
     /// The interval means different things depending on whether the system is
@@ -231,18 +252,30 @@ struct AssertionListView: View {
     }
 
     private func kill(_ record: AssertionRecord) {
-        show(monitor.kill(record).message)
+        guard !stopping else { return }
+        confirmingKillAll = false
+        stopping = true
+        Task { @MainActor in
+            let outcome = await monitor.kill(record)
+            stopping = false
+            show(outcome.message)
+        }
     }
 
     private func killAll() {
+        guard !stopping else { return }
         confirmingKillAll = false
-        let outcomes = monitor.killAllBlocking()
-        let stopped = outcomes.filter(\.succeeded).count
-        let refused = outcomes.count - stopped
-        if refused == 0 {
-            show("Stopped \(stopped) process\(stopped == 1 ? "" : "es")")
-        } else {
-            show("Stopped \(stopped), skipped \(refused)")
+        stopping = true
+        Task { @MainActor in
+            let outcomes = await monitor.killAllBlocking()
+            stopping = false
+            let stopped = outcomes.filter(\.succeeded).count
+            let refused = outcomes.count - stopped
+            if refused == 0 {
+                show("Stopped \(stopped) process\(stopped == 1 ? "" : "es")")
+            } else {
+                show("Stopped \(stopped), skipped \(refused)")
+            }
         }
     }
 }
@@ -251,25 +284,32 @@ struct AssertionListView: View {
 
 private struct AssertionRow: View {
     let record: AssertionRecord
+    let stopping: Bool
     let onKill: () -> Void
 
     @State private var expanded = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            HStack(alignment: .firstTextBaseline, spacing: 8) {
-                if record.isStale {
-                    Image(systemName: "exclamationmark.triangle.fill")
-                        .font(.system(size: 10))
-                        .foregroundStyle(.orange)
-                }
-                Text(record.displayName)
-                    .font(.system(size: 13, weight: .medium))
-                Spacer()
-                if let duration = record.duration {
-                    Text(duration.durationLabel)
-                        .font(.system(size: 12).monospacedDigit())
-                        .foregroundStyle(record.isStale ? Color.orange : Color.secondary)
+            // Ticks once a second while the popover is open. Durations are
+            // computed from "now", so without this they only moved when the
+            // list refreshed — and with checking set to "Only when opened" and
+            // live updates doing their job, that could be never.
+            TimelineView(.periodic(from: .now, by: 1)) { _ in
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    if record.isStale {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .font(.system(size: 10))
+                            .foregroundStyle(.orange)
+                    }
+                    Text(record.displayName)
+                        .font(.system(size: 13, weight: .medium))
+                    Spacer()
+                    if let duration = record.duration {
+                        Text(duration.durationLabel)
+                            .font(.system(size: 12).monospacedDigit())
+                            .foregroundStyle(record.isStale ? Color.orange : Color.secondary)
+                    }
                 }
             }
 
@@ -278,13 +318,15 @@ private struct AssertionRow: View {
                 .foregroundStyle(.secondary)
 
             HStack(spacing: 6) {
-                Tag(record.hasTimeout ? "expires in \(record.timeout.durationLabel)" : "no timeout")
+                TimelineView(.periodic(from: .now, by: 1)) { _ in
+                    Tag(record.expiryLabel)
+                }
                 if record.isOrphaned { Tag("orphaned", tint: .orange) }
                 Tag("pid \(record.pid)")
                 Spacer()
                 Button("Stop", action: onKill)
                     .controlSize(.small)
-                    .disabled(!(record.process?.isKillable ?? false))
+                    .disabled(stopping || !(record.process?.isKillable ?? false))
             }
 
             Button {
@@ -354,14 +396,16 @@ private struct BackgroundRow: View {
                 .foregroundStyle(.tertiary)
                 .lineLimit(1)
             Spacer()
-            if record.hasTimeout {
-                Text("expires")
-                    .font(.system(size: 10))
-                    .foregroundStyle(.tertiary)
-            } else if let duration = record.duration {
-                Text(duration.durationLabel)
-                    .font(.system(size: 10).monospacedDigit())
-                    .foregroundStyle(.tertiary)
+            TimelineView(.periodic(from: .now, by: 1)) { _ in
+                if record.hasTimeout {
+                    Text(record.expiryLabel)
+                        .font(.system(size: 10).monospacedDigit())
+                        .foregroundStyle(.tertiary)
+                } else if let duration = record.duration {
+                    Text(duration.durationLabel)
+                        .font(.system(size: 10).monospacedDigit())
+                        .foregroundStyle(.tertiary)
+                }
             }
         }
         .padding(.horizontal, 14)

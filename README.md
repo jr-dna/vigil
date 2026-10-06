@@ -99,8 +99,8 @@ Every assertion lands in one of two buckets:
 
 | Bucket | Meaning | Shown | Stoppable |
 |---|---|---|---|
-| **blocking** | Prevents sleep and owned by you | Top level | Yes |
-| **system** | Root-owned, denylisted, or doesn't prevent sleep | Background | No |
+| **blocking** | Prevents sleep, yours, and not part of macOS | Top level | Yes |
+| **system** | Part of macOS, root-owned, another user's, or doesn't prevent sleep | Background | No |
 
 A raw assertion dump is mostly noise. `powerd`'s *"Prevent sleep while display
 is on"* looks alarming and is purely downstream — it exists because something
@@ -135,14 +135,28 @@ Killing the wrong assertion holder is far worse than a Mac that won't sleep.
 have disabled the button:
 
 - Refuses anything with `uid == 0`
-- Refuses a name denylist regardless of owner: `powerd`, `WindowServer`,
+- Refuses anything whose executable lives where only macOS installs things —
+  `/System`, `/usr/libexec`, `/usr/sbin`, `/sbin`, `/Library/Apple` — whatever
+  it's called. System Integrity Protection keeps everything else out of those
+  paths, so location is a reliable test where a name list isn't: macOS ships
+  plenty of user-owned background agents, and some take sleep assertions while
+  they work. `/usr/bin` is deliberately not on the list, because that's where
+  `caffeinate` lives.
+- Refuses a name denylist as a backstop: `powerd`, `WindowServer`,
   `loginwindow`, `sharingd`, `useractivityd`, `cloudd`, `coreaudiod`,
   `bluetoothd`, `backupd`, `mds` and friends
 - Refuses processes owned by another user, launchd, and Vigil itself
 - **Stop all** covers only the blocking bucket, deduplicated by PID
 
-`SIGTERM` first, two-second grace period, `SIGKILL` only if the PID is still
-there.
+It also re-checks *which* process it's signalling. The row behind a Stop button
+comes from the last refresh, and PIDs are recycled — if the process you saw has
+exited and its number been handed on, a plain `kill(pid)` would hit something
+you never saw. Before each signal Vigil confirms the PID still has the start time
+it was listed with, and skips it if not.
+
+`SIGTERM` first, two-second grace period, `SIGKILL` only if the same process is
+still there. Stopping runs off the main thread, and Stop all stops everything
+concurrently, so the worst case is one grace period in total.
 
 ### Refresh
 
@@ -154,6 +168,15 @@ at all.
 What that governs is narrower than it looks: the popover refreshes on open, so
 the list you read is always current. The interval only controls how fast the menu
 bar icon reacts while the popover is closed.
+
+### Known limitation: launch agents read as orphaned
+
+The orphan flag means "parented to launchd and not an app". That's exactly the
+shape of a `caffeinate` whose script died — and also the shape of a third-party
+launch agent, which launchd starts on purpose. Apple's own agents are excluded by
+location, but a Homebrew service or a vendor helper installed as a launch agent
+will show the orange tag even though nothing went wrong. Check the command line
+before stopping one.
 
 ### Undocumented surface
 
@@ -193,8 +216,6 @@ nothing outside its own bundle except a preferences plist.
 - A user-managed ignore list for apps that legitimately hold assertions
 - Assertion history — "what kept my Mac awake last night" after the fact
 - Universal binary
-- `ProcessTerminator` blocks the main thread for up to two seconds between
-  SIGTERM and SIGKILL
 
 ## License
 

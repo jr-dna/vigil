@@ -10,13 +10,20 @@ APP       := $(BUILD_DIR)/$(CONFIG)/Vigil.app
 
 all: build
 
-## Regenerate Vigil.xcodeproj from project.yml
-project:
-	@command -v xcodegen >/dev/null || { echo "xcodegen not found: brew install xcodegen"; exit 1; }
-	xcodegen generate
-
 ICONSET := icon/Vigil.iconset
 ICNS    := Sources/Resources/Vigil.icns
+
+## Regenerate Vigil.xcodeproj from project.yml.
+##
+## Depends on the .icns: XcodeGen adds only the files that exist when it runs,
+## so generating the project before the icon is compiled leaves Vigil.icns out
+## of the Copy Bundle Resources phase — the app builds, signs and notarizes
+## cleanly, and ships with the generic icon. 0.3.1 and 0.3.2 both did exactly
+## that. (The variables above have to be defined before this rule, because make
+## expands a rule's prerequisites at the moment it reads the rule.)
+project: $(ICNS)
+	@command -v xcodegen >/dev/null || { echo "xcodegen not found: brew install xcodegen"; exit 1; }
+	xcodegen generate
 
 ## Compile the .iconset into the .icns the bundle loads.
 ## iconutil ships with macOS, so this needs nothing installed. Editing the
@@ -29,7 +36,7 @@ $(ICNS): $(wildcard $(ICONSET)/*.png)
 	@echo "Built $(ICNS)"
 
 ## Build the app bundle
-build: project $(ICNS)
+build: project
 	xcodebuild \
 		-project $(PROJECT) \
 		-scheme $(SCHEME) \
@@ -130,6 +137,10 @@ verify:
 	xcrun stapler validate "$(RELEASE_APP)"
 	@echo "--- signing identity ---"
 	@codesign -dvvv "$(RELEASE_APP)" 2>&1 | grep -E "Authority|TeamIdentifier|Timestamp|flags"
+	@echo "--- icon ---"
+	@test -f "$(RELEASE_APP)/Contents/Resources/Vigil.icns" \
+		&& echo "Vigil.icns present" \
+		|| { echo "Vigil.icns MISSING from the bundle — the app would ship with the generic icon"; exit 1; }
 
 package:
 	@mkdir -p "$(DIST_DIR)"

@@ -6,9 +6,16 @@ import Foundation
 /// annoyance, and killing `powerd` or `WindowServer` is a lost afternoon. So
 /// the refusal is structural — `terminate` re-checks the rules itself rather
 /// than trusting that the UI only enabled the button on killable rows.
+///
+/// It also re-checks *which process* it's about to signal. The record behind a
+/// Stop button comes from the last refresh, and PIDs are recycled: if the
+/// process you saw has exited and its number been handed to something new,
+/// a naive `kill(pid)` would hit the newcomer — a process you never saw and
+/// never chose. So every signal is preceded by confirming the PID still has
+/// the start time it had when it was listed.
 enum ProcessTerminator {
 
-    enum Outcome {
+    enum Outcome: Sendable {
         case terminated(pid: pid_t, name: String, escalated: Bool)
         case refused(pid: pid_t, name: String, reason: String)
         case alreadyGone(pid: pid_t, name: String)
@@ -42,25 +49,39 @@ enum ProcessTerminator {
     /// Grace period between SIGTERM and SIGKILL. `caffeinate` handles SIGTERM
     /// immediately; two seconds is slack for anything slower.
     private static let gracePeriod: TimeInterval = 2.0
-    private static let pollInterval: useconds_t = 100_000   // 100 ms
+    private static let pollInterval: UInt64 = 100_000_000   // 100 ms, in ns
 
-    static func terminate(_ record: AssertionRecord) -> Outcome {
+    /// Async so the grace period suspends instead of blocking. The previous
+    /// version slept the main thread for up to two seconds per stubborn
+    /// process, freezing the popover — and Stop all ran them one after
+    /// another, so several stubborn processes could hang it for a long time.
+    static func terminate(_ record: AssertionRecord) async -> Outcome {
         let pid = record.pid
         let name = record.displayName
 
-        guard let process = record.process else {
+        guard let listed = record.process else {
             return .refused(pid: pid, name: name,
                             reason: "its owner couldn't be identified")
         }
-        guard !process.isRootOwned else {
+
+        // Confirm this is still the process that was listed, then judge it on
+        // what's true now rather than what was true at the last refresh.
+        guard ProcessInspector.isSameProcess(pid, startedAt: listed.startedAt),
+              let current = ProcessInspector.details(for: pid),
+              current.startedAt == listed.startedAt
+        else {
+            return .alreadyGone(pid: pid, name: name)
+        }
+
+        guard !current.isRootOwned else {
             return .refused(pid: pid, name: name,
                             reason: "it runs as root")
         }
-        guard !process.isProtectedName else {
+        guard !current.isSystemPath, !current.isProtectedName else {
             return .refused(pid: pid, name: name,
-                            reason: "macOS needs it")
+                            reason: "it's part of macOS")
         }
-        guard process.uid == getuid() else {
+        guard current.uid == getuid() else {
             return .refused(pid: pid, name: name,
                             reason: "it belongs to another user")
         }
@@ -73,26 +94,44 @@ enum ProcessTerminator {
                             reason: "that's Vigil")
         }
 
-        return signal(pid: pid, name: name)
+        return await signal(pid: pid, name: name, startedAt: listed.startedAt)
     }
 
-    private static func signal(pid: pid_t, name: String) -> Outcome {
+    /// SIGTERM, a grace period, then SIGKILL only if the *same* process is
+    /// still there.
+    ///
+    /// The identity check narrows the recycled-PID window from "however long
+    /// since the last refresh" to the few microseconds between a check and the
+    /// signal that follows it. Closing it entirely would need a process handle
+    /// rather than a number, which macOS doesn't offer for signalling.
+    private static func signal(pid: pid_t, name: String, startedAt: Date?) async -> Outcome {
+        // The policy checks above took a moment; confirm again right before
+        // the first signal, as the SIGKILL path does.
+        guard ProcessInspector.isSameProcess(pid, startedAt: startedAt) else {
+            return .alreadyGone(pid: pid, name: name)
+        }
         if kill(pid, SIGTERM) != 0 {
             let code = errno
             if code == ESRCH { return .alreadyGone(pid: pid, name: name) }
             return .failed(pid: pid, name: name, errno: code)
         }
 
-        // Wait out the grace period, checking whether it went quietly.
         let deadline = Date().addingTimeInterval(gracePeriod)
         while Date() < deadline {
-            usleep(pollInterval)
-            if !ProcessInspector.isAlive(pid) {
+            try? await Task.sleep(nanoseconds: pollInterval)
+            // A cancelled sleep returns immediately, which would turn this into
+            // a busy loop for the rest of the grace period.
+            if Task.isCancelled { break }
+            if !ProcessInspector.isSameProcess(pid, startedAt: startedAt) {
                 return .terminated(pid: pid, name: name, escalated: false)
             }
         }
 
-        // Still here. Escalate.
+        // Still here after the grace period. Re-confirm immediately before the
+        // one signal that can't be ignored.
+        guard ProcessInspector.isSameProcess(pid, startedAt: startedAt) else {
+            return .terminated(pid: pid, name: name, escalated: false)
+        }
         if kill(pid, SIGKILL) != 0 {
             let code = errno
             if code == ESRCH { return .terminated(pid: pid, name: name, escalated: false) }

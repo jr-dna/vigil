@@ -16,7 +16,11 @@ enum ProcessInspector {
 
         let ppid = info.kp_eproc.e_ppid
         let uid  = info.kp_eproc.e_ucred.cr_uid
-        let (executablePath, arguments) = processArguments(for: pid)
+        let (argsPath, arguments) = processArguments(for: pid)
+
+        // The path decides whether a process counts as part of macOS, so when
+        // KERN_PROCARGS2 won't give it up, ask a second way.
+        let executablePath = argsPath.isEmpty ? (pidPath(of: pid) ?? "") : argsPath
 
         // p_comm caps at 16 characters, so prefer a path's last component when
         // we have one. argv[0] first, since it's what the user typed; then the
@@ -44,11 +48,27 @@ enum ProcessInspector {
         )
     }
 
-    static func isAlive(_ pid: pid_t) -> Bool {
-        // Signal 0 performs the permission and existence check without
-        // delivering anything.
-        kill(pid, 0) == 0 || errno == EPERM
+    /// Whether `pid` still names the process that was inspected — rather than
+    /// having exited, or been handed on to a newer process that inherited the
+    /// number.
+    ///
+    /// PIDs are recycled, so a number alone is not an identity. The kernel's
+    /// record of when the process started is: two processes can share a PID
+    /// over time, but not a PID and a start time. A zombie counts as gone,
+    /// since it has already exited and is only waiting for its parent to
+    /// collect it.
+    ///
+    /// With no recorded start time there's nothing to compare, so the answer
+    /// is no — otherwise `nil == nil` would vouch for whatever holds the PID.
+    static func isSameProcess(_ pid: pid_t, startedAt: Date?) -> Bool {
+        guard let startedAt, let info = kinfo(for: pid) else { return false }
+        if Int32(info.kp_proc.p_stat) == zombieState { return false }
+        return startDate(from: info) == startedAt
     }
+
+    /// SZOMB in <sys/proc.h>, spelled out rather than relying on the macro
+    /// making it through the Swift importer.
+    private static let zombieState: Int32 = 5
 
     // MARK: Ancestry
 
@@ -97,6 +117,17 @@ enum ProcessInspector {
             }
         }
         return name.isEmpty ? nil : name
+    }
+
+    /// The executable path via libproc. Works for processes whose argv the
+    /// kernel won't hand over.
+    private static func pidPath(of pid: pid_t) -> String? {
+        // PROC_PIDPATHINFO_MAXSIZE is 4 * MAXPATHLEN; spelled out because it's
+        // a compound macro the Swift importer may not carry across.
+        var buffer = [CChar](repeating: 0, count: 4096)
+        let length = proc_pidpath(pid, &buffer, UInt32(buffer.count))
+        guard length > 0 else { return nil }
+        return String(cString: buffer)
     }
 
     private static func startDate(from info: kinfo_proc) -> Date? {

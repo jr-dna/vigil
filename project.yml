@@ -18,9 +18,13 @@ targets:
     type: application
     platform: macOS
     sources:
+      # Resources is excluded here and added by the entry below. Including it
+      # in both would put Vigil.icns in Copy Bundle Resources twice, which the
+      # build system rejects ("multiple commands produce"). It never came up
+      # before 0.3.3 only because the .icns didn't exist yet when XcodeGen ran.
       - path: Sources
         excludes:
-          - "Resources/Info.plist"
+          - "Resources/**"
           - "Bridging/Vigil-Bridging-Header.h"
       - path: Sources/Resources
         buildPhase: resources
@@ -32,7 +36,7 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: music.jordanalegant.vigil
         INFOPLIST_FILE: Sources/Resources/Info.plist
         SWIFT_OBJC_BRIDGING_HEADER: $(SRCROOT)/Sources/Bridging/Vigil-Bridging-Header.h
-        MARKETING_VERSION: "0.3.2"
+        MARKETING_VERSION: "0.3.3"
         CURRENT_PROJECT_VERSION: "1"
         ENABLE_HARDENED_RUNTIME: YES
         COMBINE_HIDPI_IMAGES: YES

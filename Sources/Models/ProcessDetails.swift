@@ -1,14 +1,14 @@
 import Foundation
 
 /// What Vigil knows about a process holding an assertion.
-struct ProcessDetails {
+struct ProcessDetails: Sendable {
     let pid: pid_t
     let ppid: pid_t
     let uid: uid_t
     let name: String
 
-    /// The real path to the binary, from KERN_PROCARGS2 rather than argv[0].
-    /// Empty if the kernel wouldn't describe the process.
+    /// The real path to the binary — from KERN_PROCARGS2, falling back to
+    /// `proc_pidpath` — rather than argv[0]. Empty only if both refused.
     let executablePath: String
 
     /// Full command line, reconstructed from KERN_PROCARGS2. Empty if the
@@ -61,7 +61,44 @@ struct ProcessDetails {
 
     var isProtectedName: Bool { Self.protectedNames.contains(name) }
 
-    var isSystemOwned: Bool { isRootOwned || isProtectedName }
+    /// Locations only macOS itself installs into. System Integrity Protection
+    /// keeps everything else out, so a binary living here is part of the OS
+    /// whatever it happens to be called.
+    ///
+    /// This is the real protection; `protectedNames` is the backstop. A name
+    /// list only covers the processes that happened to be running on the Mac
+    /// it was written on, and macOS ships plenty of user-owned background
+    /// agents that aren't on it — some of which take sleep assertions while
+    /// they work. Without this they'd land at the top of the list, tagged
+    /// orphaned (launchd starts them, and they aren't apps), and be swept up
+    /// by Stop all.
+    ///
+    /// /usr/bin is deliberately absent: that's where `caffeinate` lives, and
+    /// a forgotten `caffeinate` is the whole reason Vigil exists.
+    static let systemPathPrefixes = [
+        "/System/",
+        "/usr/libexec/",
+        "/usr/sbin/",
+        "/sbin/",
+        "/Library/Apple/",
+    ]
+
+    /// One carve-out: the ordinary apps Apple ships in /System/Applications —
+    /// QuickTime Player, Music, TV, Podcasts — and Safari, whose real binary
+    /// lives under a cryptex path that also contains /System/Applications/.
+    /// They're apps you open and quit like any other, and a movie left playing
+    /// in QuickTime is a perfectly reasonable thing to want to stop.
+    /// /System/Library/CoreServices stays protected: Finder, Dock and
+    /// loginwindow live there.
+    var isSystemPath: Bool {
+        guard Self.systemPathPrefixes.contains(where: { executablePath.hasPrefix($0) }) else {
+            return false
+        }
+        let isUserFacingApp = isBundledApp && executablePath.contains("/System/Applications/")
+        return !isUserFacingApp
+    }
+
+    var isSystemOwned: Bool { isRootOwned || isSystemPath || isProtectedName }
 
     /// The current user can signal it, and nothing above says not to.
     var isKillable: Bool {
@@ -71,7 +108,7 @@ struct ProcessDetails {
 
 /// A link in the parent chain. Deliberately thinner than ProcessDetails —
 /// walking the chain shouldn't cost a KERN_PROCARGS2 call per ancestor.
-struct ProcessSummary: Identifiable {
+struct ProcessSummary: Identifiable, Sendable {
     let pid: pid_t
     let name: String
     var id: pid_t { pid }
